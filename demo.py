@@ -1,15 +1,22 @@
-import collections
 import itertools
-import math
 import random
 import string
-
+import sys
 
 ALL_TILES = tuple((x, y) for x, y in itertools.product(range(4), range(4)))
 ALL_INDICES = tuple(range(16))
 
 
-def simple_board(words_list):
+def read_words():
+    with open('words.txt') as f:
+        return set(w.lower()
+                   for w in f.read().replace('"', '').splitlines()
+                   if all(c in string.ascii_letters for c in w) and w.lower() == w and len(w) > 2 and len(set(w)) <= 16)
+
+
+def simple_board(words_list, all_words_list=None):
+    if all_words_list is not None and len(words_list) < 6:
+        words_list = words_list + random.sample(all_words_list, 6 - len(words_list))
     letters = list(''.join(random.sample(words_list, 6))[:16])
     random.shuffle(letters)
     return letters
@@ -41,7 +48,20 @@ def words_in_board_dupes(board, word_prefixes, words, word_so_far='', x=None, y=
             yield from words_in_board_dupes(board, word_prefixes, words, word_so_far, x + dx, y + dy)
 
 
+def all_filled_boards(partial_board):
+    none_slots = list(i for i, cell in enumerate(partial_board) if cell is None)
+    for filled_vals in itertools.product(*itertools.repeat(string.ascii_lowercase, len(none_slots))):
+        for i, letter in zip(none_slots, filled_vals):
+            partial_board[i] = letter
+        yield partial_board
+    for i in none_slots:
+        partial_board[i] = None
+
+
 def anneal_board(board, board_score):
+    # if None in board:
+    #     original_board_score = board_score
+    #     board_score = lambda b: max(original_board_score(b) for b in all_filled_boards(b))
     while True:
         best_swap = None, None
         original_score = best_score = board_score(board)
@@ -78,15 +98,19 @@ def non_overlapping_indices(n):
 
 def _precompute_indices(last_index):
     last_y, last_x = divmod(last_index, 4)
-    return tuple(
+    indices = [
         (4 * y + x)
         for x, y in itertools.product(range(max(0, last_x - 1), min(4, last_x + 2)),
                                       range(max(0, last_y - 1), min(4, last_y + 2)))
-        if x != last_x or y != last_y)
+        if x != last_x or y != last_y
+    ]
+    # Note: We precompute values for speed *BUT* also shuffle so re-running the program gives varied boards.
+    random.shuffle(indices)
+    return tuple(indices)
 
 
 _PRECOMPUTED_INDICES = [_precompute_indices(index) for index in range(16)]
-_PRECOMPUTED_INDICES.append(ALL_INDICES)
+_PRECOMPUTED_INDICES.append(tuple(sorted(ALL_INDICES, key=lambda i: random.random())))
 
 
 def _partial_board_helper_fast_unsafe(word_remaining, tile_so_far, last_index):
@@ -144,9 +168,7 @@ def optimize_for_specific_words_demo(desired_words=None, min_words=1):
 
 
 def optimize_for_generic_metric_demo():
-    with open('words.txt') as f:
-        words = set(w.lower() for w in f.read().replace('"', '').splitlines() if
-                    all(c in string.ascii_letters for c in w) and w.lower() == w and len(w) > 2 and len(set(w)) <= 16)
+    words = read_words()
 
     desired_words = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'violet', 'black', 'white', 'brown', 'pink']
     word_prefixes = set(w[:i] for w in itertools.chain(words, desired_words) for i in range(len(w) + 1))
@@ -158,7 +180,7 @@ def optimize_for_generic_metric_demo():
         ('desired words and long words', lambda board: sum((1_000_000_000 if w in desired_words else len(w)**3)
                                                            for w in words_in_board(board, word_prefixes, words)))
     ):
-        board = simple_board(list(desired_words))
+        board = simple_board(list(desired_words), list(words))
         print('Original board:')
         print_board(board)
         print(f'Annealing to optimize for "{score_name}"')
@@ -170,5 +192,52 @@ def optimize_for_generic_metric_demo():
         print()
 
 
-optimize_for_generic_metric_demo()
-optimize_for_specific_words_demo()
+def num_desired_words_in_board(board, desired_words, desired_words_prefixes):
+    return sum(1 for w in words_in_board(board, desired_words_prefixes, desired_words))
+
+
+def optimize_for_specific_words_then_generic_metric_demo(desired_words=None, min_words=1, score_function=None):
+    if desired_words is None:
+        desired_words = ['red', 'orange', 'yellow', 'green', 'blue', 'purple', 'violet', 'black', 'white', 'brown', 'pink']
+    if score_function is None:
+        # Strong bias towards long words
+        score_function = lambda board: sum(len(w)**3 for w in words_in_board(board, word_prefixes, words))
+
+    words = read_words()
+    words_list = list(words)
+    word_prefixes = set(w[:i] for w in itertools.chain(words, desired_words) for i in range(len(w) + 1))
+    desired_words_prefixes = set(w[:i] for w in desired_words for i in range(len(w) + 1))
+
+    # Note: The sorting isn't necessary but does speed things up.
+    best_len_so_far = 0
+    desired_words = sorted(desired_words, key=len, reverse=True)
+    for board, wib in partial_boards_multi(list(desired_words), [None] * 16, [], min_words):
+        if len(wib) <= best_len_so_far:
+            continue
+        board = list(board)
+        if None in board:  # If this is a partial board, then fill it in!
+            filled_board = simple_board(words_list)
+            for i, (original_cell, backup_cell) in enumerate(zip(board, filled_board)):
+                if original_cell is None:
+                    board[i] = backup_cell
+        best_len_so_far = len(wib)
+        print('Original board:')
+        print_board(board)
+        anneal_board(board, lambda b: (num_desired_words_in_board(b, desired_words, desired_words_prefixes), score_function(b)))
+        print_board(board)
+        print('Words in final board:', sorted(words_in_board(board, word_prefixes, words)))
+        print('Desired words in final board:', sorted(
+            w for w in words_in_board(board, word_prefixes, words) if w in desired_words))
+        print()
+        print()
+
+
+def main(argv):
+    desired_words = argv[1:] if len(argv) > 1 else None
+    # optimize_for_generic_metric_demo()
+    # optimize_for_specific_words_demo(desired_words)
+    optimize_for_specific_words_then_generic_metric_demo(desired_words)
+
+
+if __name__ == '__main__':
+    main(sys.argv)
